@@ -54,6 +54,13 @@ _QWEN3_PREFIX = (
     "<|im_end|>\n<|im_start|>user\n"
 )
 _QWEN3_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+# A fresh httpx.AsyncClient per request pays a new TLS handshake every call.
+# Reranks arrive in bursts (a single search fans out into several batches)
+# but are otherwise seconds to minutes apart, so idle connections are kept
+# well past httpx's 5 s default to actually get reused.
+_KEEPALIVE_EXPIRY_SECONDS = 120.0
+
 _DEFAULT_RERANK_INSTRUCTION = (
     "Given a question and a passage, determine if the passage contains "
     "information relevant to answering the question."
@@ -104,6 +111,48 @@ class DeepInfraRerankProvider:
         self._max_retries = max_retries
         self._batch_size = batch_size
         self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._client: httpx.AsyncClient | None = None
+        self._client_loop: asyncio.AbstractEventLoop | None = None
+        self._client_lock = asyncio.Lock()
+
+    async def aclose(self) -> None:
+        """Close the pooled HTTP client, if one was ever created.
+
+        No provider in this package is wired into the app's FastAPI
+        lifespan today — rerank is a lazily-built, optional (Tier-3)
+        capability with no shutdown hook of its own. Callers that own a
+        :class:`DeepInfraRerankProvider` instance directly (tests, or a
+        future lifespan provider) are responsible for calling this when
+        they are done with it. Safe to call more than once.
+        """
+        async with self._client_lock:
+            if self._client is not None:
+                await self._client.aclose()
+                self._client = None
+                self._client_loop = None
+
+    async def _http_client(self) -> httpx.AsyncClient:
+        """Return the pooled client for the running event loop.
+
+        An ``httpx.AsyncClient`` cannot be shared across event loops, so a
+        loop change (e.g. pytest-asyncio's per-test loop) rebuilds the
+        client -- closing the old one first so its connection pool does not
+        leak. Guarded by a lock so concurrent callers (multiple in-flight
+        rerank chunks share one provider, see ``_semaphore``) can't race to
+        create/close the client twice.
+        """
+        async with self._client_lock:
+            loop = asyncio.get_running_loop()
+            if self._client is not None and self._client_loop is not loop:
+                await self._client.aclose()
+                self._client = None
+            if self._client is None:
+                self._client = httpx.AsyncClient(
+                    timeout=self._timeout,
+                    limits=httpx.Limits(keepalive_expiry=_KEEPALIVE_EXPIRY_SECONDS),
+                )
+                self._client_loop = loop
+            return self._client
 
     async def rerank(
         self,
@@ -149,10 +198,10 @@ class DeepInfraRerankProvider:
         async with self._semaphore:
             for attempt in range(self._max_retries + 1):
                 try:
-                    async with httpx.AsyncClient(timeout=self._timeout) as client:
-                        response = await client.post(
-                            self._url, json=payload, headers=headers
-                        )
+                    client = await self._http_client()
+                    response = await client.post(
+                        self._url, json=payload, headers=headers
+                    )
                 except httpx.HTTPError as exc:
                     if attempt == self._max_retries:
                         raise transport_error("DeepInfra", exc) from exc
