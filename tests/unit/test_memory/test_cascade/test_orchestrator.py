@@ -250,3 +250,27 @@ async def test_watcher_can_be_disabled_without_losing_the_worker(
         assert orch._worker is not None
         assert orch._scanner is not None
         await orch.stop()
+
+
+async def test_maintenance_env_var_reaches_the_worker(
+    runtime: MemoryRoot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``EVEROS_DISABLE_CASCADE_MAINTENANCE`` gates only the worker's
+    background maintenance loops (heartbeat / optimize / rebuild) — unlike
+    ``EVEROS_DISABLE_CASCADE_WATCHER`` it does not touch scanning or the
+    watcher, and the drain loop that writes cascade's md -> LanceDB
+    projection is unaffected. This lets an "online" instance built with the
+    flag keep serving writes while a separate maintenance-only instance
+    (without the flag) owns index upkeep.
+    """
+    monkeypatch.setenv("EVEROS_DISABLE_CASCADE_MAINTENANCE", "1")
+    orch = _make_orchestrator(runtime)
+    assert orch._worker._maintenance_enabled is False
+
+
+async def test_maintenance_defaults_enabled_when_env_var_unset(
+    runtime: MemoryRoot,
+) -> None:
+    """No env var set (every deployment before this change) -> maintenance on."""
+    orch = _make_orchestrator(runtime)
+    assert orch._worker._maintenance_enabled is True

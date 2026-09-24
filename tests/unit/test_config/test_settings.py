@@ -130,6 +130,26 @@ def test_index_milvus_defaults() -> None:
     assert s.milvus.collection_prefix == "everos"
 
 
+def test_cascade_settings_pydantic_defaults() -> None:
+    """``CascadeSettings()`` bare defaults, independent of ``default.toml``.
+
+    Automatic full index rebuild is disabled by default (interval 0) — it
+    can retain GiB-scale native Arrow/Lance allocations on a production-
+    sized table, so it is opt-in only. Every other cadence is unchanged.
+    """
+    s = Settings()
+    assert s.cascade.optimize_heartbeat_seconds == 60.0
+    assert s.cascade.optimize_prune_interval_seconds == 300.0
+    assert s.cascade.optimize_prune_retention_seconds == 60.0
+    assert s.cascade.optimize_rebuild_interval_seconds == 0.0
+
+
+def test_load_settings_cascade_rebuild_disabled_by_default() -> None:
+    """The shipped ``default.toml`` also ships rebuild disabled."""
+    s = load_settings()
+    assert s.cascade.optimize_rebuild_interval_seconds == 0.0
+
+
 def test_index_milvus_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("EVEROS_INDEX__BACKEND", "milvus")
     monkeypatch.setenv("EVEROS_MILVUS__URI", "http://localhost:19530")

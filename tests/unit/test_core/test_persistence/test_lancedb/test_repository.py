@@ -160,6 +160,101 @@ async def test_upsert_updates_on_existing(repo: _NoteRepo) -> None:
     assert await repo.count() == 1  # update, not append
 
 
+class _RecordingUpsertTable:
+    """Records whether ``upsert`` took the fast ``add`` path or fell back
+    to ``merge_insert``, and with what arguments."""
+
+    def __init__(self, *, existing: int) -> None:
+        self._existing = existing
+        self.count_rows_filters: list[str] = []
+        self.add_calls: list[list[_Note]] = []
+        self.merge_insert_calls: list[list[_Note]] = []
+        self._merge_on: str | None = None
+
+    async def count_rows(self, *, filter: str) -> int:
+        self.count_rows_filters.append(filter)
+        return self._existing
+
+    async def add(self, records: list[_Note]) -> None:
+        self.add_calls.append(list(records))
+
+    def merge_insert(self, on: str) -> _RecordingUpsertTable:
+        self._merge_on = on
+        return self
+
+    def when_matched_update_all(self) -> _RecordingUpsertTable:
+        return self
+
+    def when_not_matched_insert_all(self) -> _RecordingUpsertTable:
+        return self
+
+    async def execute(self, records: list[_Note]) -> None:
+        self.merge_insert_calls.append(list(records))
+
+
+async def test_upsert_uses_add_fast_path_when_all_keys_new() -> None:
+    """When a cheap PK probe finds none of the batch's keys already in the
+    table, upsert takes the append-only ``add`` path instead of the
+    read-modify-write ``merge_insert`` — cheaper because ``merge_insert``
+    rewrites the fragment it touches even for a purely-new batch."""
+    table = _RecordingUpsertTable(existing=0)
+    repo = _NoteRepo(table=table)  # type: ignore[arg-type]
+    rows = [_row(owner="u1", entry="ep_1"), _row(owner="u1", entry="ep_2")]
+    await repo.upsert(rows)
+    assert table.add_calls == [rows]
+    assert table.merge_insert_calls == []
+    assert table.count_rows_filters == ["id IN ('u1_ep_1', 'u1_ep_2')"]
+
+
+async def test_upsert_falls_back_to_merge_insert_when_a_key_exists() -> None:
+    """As soon as the probe finds an existing key, the whole batch takes the
+    ``merge_insert`` path — the fast path only fires when it can guarantee
+    every row is a plain insert."""
+    table = _RecordingUpsertTable(existing=1)
+    repo = _NoteRepo(table=table)  # type: ignore[arg-type]
+    rows = [_row(owner="u1", entry="ep_1")]
+    await repo.upsert(rows)
+    assert table.merge_insert_calls == [rows]
+    assert table.add_calls == []
+
+
+async def test_upsert_is_noop_on_empty_records() -> None:
+    """No rows submitted -> no table interaction at all."""
+    table = _RecordingUpsertTable(existing=0)
+    repo = _NoteRepo(table=table)  # type: ignore[arg-type]
+    await repo.upsert([])
+    assert table.count_rows_filters == []
+    assert table.add_calls == []
+    assert table.merge_insert_calls == []
+
+
+async def test_upsert_rejects_unknown_key_column() -> None:
+    table = _RecordingUpsertTable(existing=0)
+    repo = _NoteRepo(table=table)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="unknown upsert key"):
+        await repo.upsert([_row(owner="u1", entry="ep_1")], by="not_a_real_column")
+
+
+async def test_upsert_duplicate_keys_within_new_batch_matches_merge_insert_baseline(
+    repo: _NoteRepo,
+) -> None:
+    """Two rows sharing a PK, both new to the (real) table, in one call.
+
+    Pins the pre-existing (unchanged by this fast path) behaviour of
+    ``merge_insert(...).when_not_matched_insert_all()``: it does not dedup
+    *within* a batch, so a duplicate key already produced two rows before
+    this fast path existed (verified directly against lancedb 0.34.0 — a
+    batch of two new rows sharing one id yields two rows, not one, no
+    error). The ``add()`` fast path is a pure append with no PK
+    enforcement either, so it reproduces the exact same outcome rather
+    than silently starting to dedup a case the baseline never handled.
+    """
+    dup_a = _row(owner="u1", entry="ep_1", text="first")
+    dup_b = _row(owner="u1", entry="ep_1", text="second")
+    await repo.upsert([dup_a, dup_b])
+    assert await repo.count() == 2
+
+
 # ── find_where / find_one_where ─────────────────────────────────────────
 
 

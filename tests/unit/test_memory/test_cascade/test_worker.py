@@ -485,15 +485,11 @@ async def test_stop_waits_for_in_flight_optimize(
         retry_backoff_seconds=0,
         optimize_min_interval_seconds=0.02,
         optimize_heartbeat_seconds=10.0,
-        # Park rebuild interval — startup sweep still fires but we wait
-        # for it before testing optimize semantics.
+        # Parked well outside this test's window — rebuild no longer fires
+        # on startup, so it would not run anyway.
         optimize_rebuild_interval_seconds=10.0,
     )
     await w.start()
-    # Let the startup rebuild sweep complete (instant for the fake repo)
-    # before scheduling optimize — otherwise optimize would queue behind it.
-    await asyncio.sleep(0.02)
-    assert fake.rebuild_calls, "startup rebuild should have fired by now"
     w._schedule_optimize("episode")
     await asyncio.sleep(0.01)  # let optimize start
     await w.stop()
@@ -682,13 +678,18 @@ async def test_prune_recurs_once_per_cadence_across_light_beats(
 # ── Rebuild scheduler tests ────────────────────────────────────────────────
 
 
-async def test_rebuild_runs_on_startup_for_every_kind(
+async def test_rebuild_does_not_run_on_startup(
     patched_repo: _FakeRepo,
 ) -> None:
-    """The first rebuild sweep fires on worker start, before any interval.
+    """The first rebuild sweep waits for the configured interval — it no
+    longer fires immediately on worker start.
 
-    Otherwise a daemon that restarts more often than the rebuild
-    interval would never bound accumulated UUIDs.
+    Firing on start meant restart frequency controlled maintenance
+    frequency, and a full rebuild can retain GiB-scale native Arrow/Lance
+    allocations on a production-sized table before the server has served
+    its first request. Regular optimize/prune heartbeats already keep the
+    unindexed tail and dead files bounded between rebuilds, so a restart
+    must not force an extra O(N) rebuild.
     """
     fake_a = _FakeLanceRepo()
     fake_b = _FakeLanceRepo()
@@ -700,21 +701,19 @@ async def test_rebuild_runs_on_startup_for_every_kind(
         retry_backoff_seconds=0,
         optimize_min_interval_seconds=0.01,
         optimize_heartbeat_seconds=10.0,  # park heartbeat
-        optimize_rebuild_interval_seconds=10.0,  # only the startup sweep should fire
+        optimize_rebuild_interval_seconds=10.0,  # far outside this test's window
     )
     await w.start()
-    # Allow the startup sweep to complete; the next tick is 10s away.
     await asyncio.sleep(0.1)
     await w.stop()
-    # Exactly one rebuild per kind: the startup sweep. Next interval is 10s.
-    assert len(fake_a.rebuild_calls) == 1
-    assert len(fake_b.rebuild_calls) == 1
+    assert fake_a.rebuild_calls == []
+    assert fake_b.rebuild_calls == []
 
 
 async def test_rebuild_runs_periodically(
     patched_repo: _FakeRepo,
 ) -> None:
-    """After the startup sweep, rebuild repeats every interval."""
+    """Rebuild repeats every interval, with no startup sweep offsetting it."""
     fake = _FakeLanceRepo()
     w = CascadeWorker(
         {"episode": _OkHandlerWithRepo(fake)},
@@ -724,11 +723,10 @@ async def test_rebuild_runs_periodically(
         optimize_rebuild_interval_seconds=0.05,  # ~tick every 50ms in this test
     )
     await w.start()
-    await asyncio.sleep(0.2)  # ~4 ticks plus startup sweep
+    await asyncio.sleep(0.22)  # ~4 intervals
     await w.stop()
-    # Startup sweep + at least 2 interval-driven sweeps.
-    assert len(fake.rebuild_calls) >= 3, (
-        f"expected ≥3 rebuilds (1 startup + ≥2 periodic), got {len(fake.rebuild_calls)}"
+    assert len(fake.rebuild_calls) >= 2, (
+        f"expected >=2 periodic rebuilds, got {len(fake.rebuild_calls)}"
     )
 
 
@@ -742,16 +740,140 @@ async def test_rebuild_failure_does_not_crash_daemon(
         retry_backoff_seconds=0,
         optimize_min_interval_seconds=0.01,
         optimize_heartbeat_seconds=0.05,
-        optimize_rebuild_interval_seconds=10.0,
+        optimize_rebuild_interval_seconds=0.05,
     )
     await w.start()
-    # Give startup rebuild a chance to throw, then heartbeat to keep optimizing.
+    # Let a rebuild sweep fire and throw, then let the heartbeat keep optimizing.
     await asyncio.sleep(0.12)
     # Optimize should still progress despite rebuild errors.
     assert fake.beats, "heartbeat optimize should run even when rebuild fails"
     await w.stop()
     # Worker is still alive (stop() returned cleanly).
     assert w._task is None
+
+
+# ── maintenance_enabled switch ──────────────────────────────────────────────
+
+
+async def test_maintenance_disabled_stops_background_loops_but_drain_still_runs(
+    patched_repo: _FakeRepo,
+) -> None:
+    """``maintenance_enabled=False`` fully stops heartbeat, rebuild, and (by
+    extension) the optimize-fallback-rebuild path — but the drain loop, which
+    actually serves cascade's md -> LanceDB writes, keeps running. This is
+    the split an "online" (query-serving) instance needs: it must still
+    write, but a separate maintenance-only instance owns index upkeep.
+    """
+    fake = _FakeLanceRepo()
+    patched_repo.batch = [_Row(md_path="a.md")]
+    w = CascadeWorker(
+        {"episode": _OkHandlerWithRepo(fake)},
+        retry_backoff_seconds=0,
+        optimize_min_interval_seconds=0.01,
+        optimize_heartbeat_seconds=0.02,
+        optimize_rebuild_interval_seconds=0.02,
+        maintenance_enabled=False,
+    )
+    await w.start()
+    assert w._heartbeat_task is None
+    assert w._rebuild_task is None
+    await asyncio.sleep(0.1)
+    await w.stop()
+
+    # Drain still processed the row — writes are unaffected.
+    assert patched_repo.done == ["a.md"]
+    # No maintenance beat of any kind fired.
+    assert fake.beats == []
+    assert fake.rebuild_calls == []
+
+
+async def test_maintenance_disabled_schedule_optimize_is_noop(
+    patched_repo: _FakeRepo,
+) -> None:
+    """Even a direct ``_schedule_optimize`` call — what ``drain_once`` makes
+    after every batch that touched a kind — must not register optimizer
+    state when maintenance is disabled."""
+    fake = _FakeLanceRepo()
+    w = CascadeWorker(
+        {"episode": _OkHandlerWithRepo(fake)},
+        retry_backoff_seconds=0,
+        maintenance_enabled=False,
+    )
+    w._schedule_optimize("episode")
+    assert "episode" not in w._optimizer_states
+    assert fake.beats == []
+
+
+async def test_maintenance_enabled_defaults_true_preserves_single_instance_behavior(
+    patched_repo: _FakeRepo,
+) -> None:
+    """A caller that does not pass ``maintenance_enabled`` (every deployment
+    before this change existed) must see no behaviour change from its
+    introduction: the flag defaults to ``True``, heartbeat still spawns, and
+    it still schedules optimize."""
+    fake = _FakeLanceRepo()
+    w = CascadeWorker(
+        {"episode": _OkHandlerWithRepo(fake)},
+        retry_backoff_seconds=0,
+        optimize_min_interval_seconds=0.01,
+        optimize_heartbeat_seconds=0.03,
+    )
+    assert w._maintenance_enabled is True
+    await w.start()
+    assert w._heartbeat_task is not None
+    await asyncio.sleep(0.08)
+    await w.stop()
+    assert fake.beats, "heartbeat must still schedule optimize by default"
+
+
+async def test_maintenance_enabled_but_rebuild_interval_zero_only_disables_rebuild(
+    patched_repo: _FakeRepo,
+) -> None:
+    """The new shipped default shape: maintenance on, rebuild interval 0.
+    Heartbeat and optimize must still run; only the rebuild sub-loop is off.
+    """
+    fake = _FakeLanceRepo()
+    w = CascadeWorker(
+        {"episode": _OkHandlerWithRepo(fake)},
+        retry_backoff_seconds=0,
+        optimize_min_interval_seconds=0.01,
+        optimize_heartbeat_seconds=0.03,
+        optimize_rebuild_interval_seconds=0.0,
+    )
+    await w.start()
+    assert w._heartbeat_task is not None
+    assert w._rebuild_task is None
+    await asyncio.sleep(0.08)
+    await w.stop()
+    assert fake.beats, "heartbeat/optimize must still run when only rebuild is off"
+    assert fake.rebuild_calls == []
+
+
+async def test_optimize_fallback_rebuild_skipped_when_rebuild_interval_is_zero(
+    patched_repo: _FakeRepo,
+) -> None:
+    """Rebuild is opt-in only: ``optimize_rebuild_interval_seconds=0`` must
+    also gate the *fallback* rebuild that sustained optimize failures
+    trigger, not just the periodic sweep — otherwise a table stuck failing
+    its light beat would still get an unrequested full rebuild."""
+    from everos.memory.cascade import worker as wmod
+
+    repo = _OptimizeFailingRepo()
+    w = CascadeWorker(
+        {"episode": _OkHandlerWithRepo(repo)},
+        retry_backoff_seconds=0,
+        optimize_min_interval_seconds=0.05,
+        optimize_rebuild_interval_seconds=0.0,
+    )
+    w._optimizer_states["episode"] = wmod._KindOptimizerState()
+
+    threshold = wmod._OPTIMIZE_FAILURE_ALERT_THRESHOLD
+    for _ in range(threshold):
+        await w._run_optimize_once("episode")
+
+    assert repo.rebuild_calls == [], (
+        "rebuild is opt-in; interval=0 must skip the fallback rebuild too"
+    )
 
 
 class _OptimizeFailingRepo(_FakeLanceRepo):

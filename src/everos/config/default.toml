@@ -206,7 +206,9 @@ optimize_prune_interval_seconds = 300.0
 # read, but it also decides how long index files keep a manifest naming them:
 # under LanceDB's 7-day unverified window they then wait out the full 7 days.
 optimize_prune_retention_seconds = 60.0
-optimize_rebuild_interval_seconds = 43200.0
+# 0 disables in-process full index rebuilds. Enable only after measuring native
+# memory retention on the actual dataset; optimize/prune stay active regardless.
+optimize_rebuild_interval_seconds = 0.0
 
 [observability]
 # OpenTelemetry tracing export. Off by default; pure OTLP/HTTP, vendor-neutral

@@ -412,21 +412,50 @@ class LanceRepoBase[T: BaseLanceTable]:
     ) -> None:
         """Upsert records keyed by ``by`` (PK column, default ``"id"``).
 
-        Wraps LanceDB's ``merge_insert(on=...)`` fluent builder with the
-        equivalent of ``INSERT ... ON CONFLICT(by) DO UPDATE`` — matching
-        rows are replaced wholesale, non-matching rows inserted.
+        Cheap PK-existence probe first: when none of the submitted keys are
+        already in the table, this takes LanceDB's append-only ``add`` path
+        instead of ``merge_insert``. This matters for daily logs, where a
+        batch is almost always new rows — ``merge_insert`` is a read-modify-
+        write that rewrites the fragment it touches, and against a large
+        fragment that can retain GiB-scale native Arrow/Lance allocations
+        even when the batch merely appends a handful of new entries.
+
+        Falls back to the read-modify-write path — LanceDB's
+        ``merge_insert(on=...)``, equivalent to ``INSERT ... ON CONFLICT(by)
+        DO UPDATE`` (matching rows replaced wholesale, non-matching rows
+        inserted) — whenever the probe finds an existing key, or ``by``
+        isn't a plain string column the probe can build a ``WHERE ... IN
+        (...)`` predicate from.
+
+        A duplicate key *within* one batch is not a new case: whichever
+        path runs, LanceDB's ``when_not_matched_insert_all`` never dedups
+        within a batch either, so two rows sharing a new key have always
+        both landed (verified against lancedb 0.34.0). The fast path
+        preserves that, rather than introducing new dedup semantics.
 
         Cascade uses this when reconciling md → LanceDB: an entry seen
         for the first time inserts; an entry that was edited in md
         updates its existing row.
         """
+        rows = list(records)
+        if not rows:
+            return
+        if by not in self.schema.model_fields:
+            raise ValueError(f"unknown upsert key: {by!r}")
         async with self._locked(_WRITE_TIMEOUT_SECONDS, "upsert"):
             table = await self._table()
+            key_values = [getattr(row, by) for row in rows]
+            if all(isinstance(value, str) for value in key_values):
+                quoted = ", ".join(f"'{_q(value)}'" for value in key_values)
+                existing = await table.count_rows(filter=f"{by} IN ({quoted})")
+                if existing == 0:
+                    await table.add(rows)
+                    return
             await (
                 table.merge_insert(by)
                 .when_matched_update_all()
                 .when_not_matched_insert_all()
-                .execute(list(records))
+                .execute(rows)
             )
 
     # ── Maintenance ────────────────────────────────────────────────────────

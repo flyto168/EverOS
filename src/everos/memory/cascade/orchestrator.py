@@ -112,7 +112,17 @@ class CascadeConfig:
 
 
 class CascadeOrchestrator:
-    """Composite owner of the cascade subsystem."""
+    """Composite owner of the cascade subsystem.
+
+    ``EVEROS_DISABLE_CASCADE_MAINTENANCE`` (``1``/``true``/``yes``) disables
+    the worker's background heartbeat / optimize / rebuild loops while
+    leaving the drain loop running — an "online" (query-serving) instance
+    keeps writing cascade's md -> LanceDB projection but leaves index
+    maintenance to a separate maintenance-only instance. Unlike
+    ``EVEROS_DISABLE_CASCADE_WATCHER`` this does not touch scanning or
+    inotify; it only gates :class:`~everos.memory.cascade.worker.CascadeWorker`
+    maintenance.
+    """
 
     def __init__(
         self,
@@ -148,6 +158,10 @@ class CascadeOrchestrator:
             optimize_rebuild_interval_seconds=(
                 self._config.optimize_rebuild_interval_seconds
             ),
+            maintenance_enabled=os.getenv("EVEROS_DISABLE_CASCADE_MAINTENANCE", "")
+            .strip()
+            .lower()
+            not in ("1", "true", "yes"),
         )
         self._watcher: CascadeWatcher | None = None
         self._started = False

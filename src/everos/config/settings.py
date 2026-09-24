@@ -547,14 +547,16 @@ class CascadeSettings(BaseModel):
 
     ``optimize_rebuild_interval_seconds``:
       Full index rebuild per kind, which collapses the active index fragment
-      count that every ``optimize()`` grows. Bounded by rebuild cost, not
-      correctness — a missed sweep only defers cleanup.
+      count that every ``optimize()`` grows. ``0`` disables automatic full
+      rebuilds. They are disabled by default because Arrow/Lance can retain
+      GiB-scale native allocations after rebuilding a production-sized table;
+      regular optimize/prune remains enabled for routine maintenance.
     """
 
     optimize_heartbeat_seconds: float = 60.0
     optimize_prune_interval_seconds: float = 300.0
     optimize_prune_retention_seconds: float = 60.0
-    optimize_rebuild_interval_seconds: float = 12 * 60 * 60.0
+    optimize_rebuild_interval_seconds: float = 0.0
 
 
 class IndexSettings(BaseModel):
