@@ -187,6 +187,9 @@ async def test_direct_path_fetches_via_timestamp_and_writes_profile(
         mock_episode_repo.list_by_owner_after_ts = AsyncMock(return_value=[ep_row])
         mock_episode_repo.count_by_owner = AsyncMock(return_value=1)
         mock_memcell_repo.find_by_ids = AsyncMock(return_value=[mc_row])
+        mock_memcell_repo.select_oldest_batch = AsyncMock(
+            side_effect=lambda ids, **_: ids
+        )
         mock_reader_cls.return_value.read = AsyncMock(return_value=None)
         mock_writer_cls.return_value.write = AsyncMock(return_value=None)
         mock_extractor_cls.return_value.aextract = AsyncMock(return_value=new_profile)
@@ -294,6 +297,9 @@ async def test_cluster_path_unaffected_by_dual_trigger_refactor(
         mock_cluster_repo.list_for_owner = AsyncMock(return_value=[cluster])
         mock_episode_repo.find_by_owner_entries = AsyncMock(return_value=[ep_row])
         mock_memcell_repo.find_by_ids = AsyncMock(return_value=[mc_row])
+        mock_memcell_repo.select_oldest_batch = AsyncMock(
+            side_effect=lambda ids, **_: ids
+        )
         mock_reader_cls.return_value.read = AsyncMock(return_value=None)
         mock_writer_cls.return_value.write = AsyncMock(return_value=None)
         mock_extractor_cls.return_value.aextract = AsyncMock(return_value=new_profile)
@@ -530,6 +536,9 @@ async def test_direct_path_does_not_throttle_at_default_interval_1(
         mock_episode_repo.count_by_owner = AsyncMock(return_value=7)
         mock_episode_repo.list_by_owner_after_ts = AsyncMock(return_value=[ep_row])
         mock_memcell_repo.find_by_ids = AsyncMock(return_value=[mc_row])
+        mock_memcell_repo.select_oldest_batch = AsyncMock(
+            side_effect=lambda ids, **_: ids
+        )
         mock_reader_cls.return_value.read = AsyncMock(return_value=None)
         mock_writer_cls.return_value.write = AsyncMock(return_value=None)
         mock_extractor_cls.return_value.aextract = AsyncMock(return_value=new_profile)
@@ -605,6 +614,9 @@ async def test_direct_path_fires_when_count_is_multiple_of_interval(
         mock_episode_repo.count_by_owner = AsyncMock(return_value=5)
         mock_episode_repo.list_by_owner_after_ts = AsyncMock(return_value=[ep_row])
         mock_memcell_repo.find_by_ids = AsyncMock(return_value=[mc_row])
+        mock_memcell_repo.select_oldest_batch = AsyncMock(
+            side_effect=lambda ids, **_: ids
+        )
         mock_reader_cls.return_value.read = AsyncMock(return_value=None)
         mock_writer_cls.return_value.write = AsyncMock(return_value=None)
         mock_extractor_cls.return_value.aextract = AsyncMock(return_value=new_profile)
@@ -746,6 +758,9 @@ async def test_direct_path_throttle_ignores_reflection_merged_episodes(
         mock_episode_repo.count_by_owner = AsyncMock(side_effect=_fake_count)
         mock_episode_repo.list_by_owner_after_ts = AsyncMock(return_value=[ep_row])
         mock_memcell_repo.find_by_ids = AsyncMock(return_value=[mc_row])
+        mock_memcell_repo.select_oldest_batch = AsyncMock(
+            side_effect=lambda ids, **_: ids
+        )
         mock_reader_cls.return_value.read = AsyncMock(return_value=None)
         mock_writer_cls.return_value.write = AsyncMock(return_value=None)
         mock_extractor_cls.return_value.aextract = AsyncMock(return_value=new_profile)

@@ -12,11 +12,16 @@ Pins the ``find_by_ids`` contract:
   regardless of chunk boundaries — downstream code sorts by timestamp,
   but the pre-sort order is stable across runs.
 - **Empty fast-path**: no id list → no SQL, empty result.
+
+Also pins the ``select_oldest_batch`` contract: oldest-first ids newer
+than a given timestamp, bounded by count and cumulative payload bytes,
+used by ``extract_user_profile`` to work a backlog off in bounded
+batches instead of feeding an unbounded candidate set to the LLM.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -45,7 +50,12 @@ async def repo(tmp_path: Path) -> _MemcellRepo:
     return _MemcellRepo(session_factory=factory)
 
 
-def _memcell(memcell_id: str) -> Memcell:
+def _memcell(
+    memcell_id: str,
+    *,
+    timestamp: datetime = datetime(2026, 5, 17, tzinfo=UTC),
+    payload_bytes: int = 2,
+) -> Memcell:
     """Build a minimal Memcell row — only ``memcell_id`` uniqueness matters."""
     return Memcell(
         memcell_id=memcell_id,
@@ -56,8 +66,8 @@ def _memcell(memcell_id: str) -> Memcell:
         raw_type="chat",
         message_ids_json="[]",
         sender_ids_json="[]",
-        payload_json="{}",
-        timestamp=datetime(2026, 5, 17, tzinfo=UTC),
+        payload_json="x" * payload_bytes,
+        timestamp=timestamp,
     )
 
 
@@ -141,3 +151,111 @@ async def test_find_by_ids_handles_chunk_size_larger_than_sqlite_limit(
     # appeared in ``query_ids`` (fakes are silently dropped between them).
     expected_order = [mid for mid in query_ids if mid in set(real_ids)]
     assert got_ids == expected_order
+
+
+# ── select_oldest_batch ────────────────────────────────────────────────────
+
+
+async def test_select_oldest_batch_empty_input_returns_empty(
+    repo: _MemcellRepo,
+) -> None:
+    """No candidate ids → empty result, no SQL."""
+    result = await repo.select_oldest_batch(
+        [], after=None, max_count=50, max_bytes=1024
+    )
+    assert result == []
+
+
+async def test_select_oldest_batch_orders_oldest_first_and_caps_count(
+    repo: _MemcellRepo,
+) -> None:
+    """More candidates than ``max_count`` → only the oldest N are picked."""
+    base = datetime(2026, 5, 17, tzinfo=UTC)
+    ids = [f"mc_{i:03d}" for i in range(5)]
+    # Insert newest-first so DB row order cannot accidentally match the
+    # expected oldest-first output.
+    rows = [
+        _memcell(mid, timestamp=base + timedelta(seconds=i))
+        for i, mid in enumerate(ids)
+    ][::-1]
+    await repo.insert_many(rows)
+
+    result = await repo.select_oldest_batch(
+        list(reversed(ids)), after=None, max_count=3, max_bytes=1024
+    )
+    assert result == ids[:3]
+
+
+async def test_select_oldest_batch_strict_after_boundary(repo: _MemcellRepo) -> None:
+    """``after`` is a strict ``>``: equal-ts rows excluded, newer included."""
+    boundary = datetime(2026, 5, 17, tzinfo=UTC)
+    await repo.insert_many(
+        [
+            _memcell("mc_equal", timestamp=boundary),
+            _memcell("mc_newer", timestamp=boundary + timedelta(seconds=1)),
+        ]
+    )
+
+    result = await repo.select_oldest_batch(
+        ["mc_equal", "mc_newer"], after=boundary, max_count=50, max_bytes=1024
+    )
+    assert result == ["mc_newer"]
+
+
+async def test_select_oldest_batch_caps_cumulative_payload_bytes(
+    repo: _MemcellRepo,
+) -> None:
+    """Rows are added while the running total stays within ``max_bytes``."""
+    base = datetime(2026, 5, 17, tzinfo=UTC)
+    await repo.insert_many(
+        [
+            _memcell("mc_a", timestamp=base, payload_bytes=100),
+            _memcell("mc_b", timestamp=base + timedelta(seconds=1), payload_bytes=100),
+            _memcell("mc_c", timestamp=base + timedelta(seconds=2), payload_bytes=100),
+        ]
+    )
+
+    # Budget fits the first two rows (200 bytes) but not a third.
+    result = await repo.select_oldest_batch(
+        ["mc_a", "mc_b", "mc_c"], after=None, max_count=50, max_bytes=200
+    )
+    assert result == ["mc_a", "mc_b"]
+
+
+async def test_select_oldest_batch_keeps_single_oversized_row(
+    repo: _MemcellRepo,
+) -> None:
+    """A solitary row whose payload alone exceeds ``max_bytes`` is still kept.
+
+    Otherwise a single oversized memcell would wedge the backlog forever:
+    every run selects it, the bytes cap rejects it before it is ever
+    included, and the profile timestamp never advances past it.
+    """
+    huge_ts = datetime(2026, 5, 17, tzinfo=UTC)
+    await repo.insert_many([_memcell("mc_huge", timestamp=huge_ts, payload_bytes=5000)])
+
+    result = await repo.select_oldest_batch(
+        ["mc_huge"], after=None, max_count=50, max_bytes=1024
+    )
+    assert result == ["mc_huge"]
+
+
+async def test_select_oldest_batch_oversized_row_does_not_block_the_next(
+    repo: _MemcellRepo,
+) -> None:
+    """The oversized-first-row exception applies only to that first row —
+    a second row is still bytes-capped normally."""
+    base = datetime(2026, 5, 17, tzinfo=UTC)
+    await repo.insert_many(
+        [
+            _memcell("mc_huge", timestamp=base, payload_bytes=5000),
+            _memcell(
+                "mc_small", timestamp=base + timedelta(seconds=1), payload_bytes=100
+            ),
+        ]
+    )
+
+    result = await repo.select_oldest_batch(
+        ["mc_huge", "mc_small"], after=None, max_count=50, max_bytes=1024
+    )
+    assert result == ["mc_huge"]

@@ -142,6 +142,9 @@ async def test_init_mode_writes_profile_when_no_existing(
         mock_cluster_repo.list_for_owner = AsyncMock(return_value=[cluster])
         mock_episode_repo.find_by_owner_entries = AsyncMock(return_value=ep_rows)
         mock_memcell_repo.find_by_ids = AsyncMock(return_value=mc_rows)
+        mock_memcell_repo.select_oldest_batch = AsyncMock(
+            side_effect=lambda ids, **_: ids
+        )
         mock_reader_cls.return_value.read = AsyncMock(return_value=None)
         mock_writer_cls.return_value.write = AsyncMock(return_value=None)
         mock_extractor_cls.return_value.aextract = AsyncMock(return_value=new_profile)
@@ -228,6 +231,9 @@ async def test_update_mode_rehydrates_old_profile(
         mock_cluster_repo.list_for_owner = AsyncMock(return_value=[cluster])
         mock_episode_repo.find_by_owner_entries = AsyncMock(return_value=ep_rows)
         mock_memcell_repo.find_by_ids = AsyncMock(return_value=mc_rows)
+        mock_memcell_repo.select_oldest_batch = AsyncMock(
+            side_effect=lambda ids, **_: ids
+        )
         mock_reader_cls.return_value.read = AsyncMock(
             return_value=(existing_fm, "prior summary")
         )
@@ -288,6 +294,9 @@ async def test_skips_when_no_members(monkeypatch: pytest.MonkeyPatch) -> None:
     ):
         mock_cluster_repo.list_for_owner = AsyncMock(return_value=[stale_cluster])
         mock_memcell_repo.find_by_ids = AsyncMock(return_value=[])
+        mock_memcell_repo.select_oldest_batch = AsyncMock(
+            side_effect=lambda ids, **_: ids
+        )
         mock_reader_cls.return_value.read = AsyncMock(
             return_value=(existing_fm, "prior")
         )
@@ -372,6 +381,13 @@ async def _run_serialisation_probe(
                 _memcell_row(ids[0], sender_id="sender", ts_ms=1_700_000_000_000)
             ]
         )
+        # select_oldest_batch pass-through: this probe only exercises the
+        # partition lock, not the bounding logic — but the strategy now
+        # always calls it, so the serialisation guarantee it asserts still
+        # has to hold with the bounded-batch step in the critical section.
+        mock_memcell_repo.select_oldest_batch = AsyncMock(
+            side_effect=lambda ids, **_: ids
+        )
         mock_reader_cls.return_value.read = AsyncMock(return_value=[])
         mock_writer_cls.return_value.write = AsyncMock(return_value=None)
         mock_extractor_cls.return_value.aextract = mock_aextract
@@ -412,3 +428,67 @@ async def test_partition_lock_lets_different_owners_run_in_parallel(
     log = await _run_serialisation_probe("u_alice", "u_bob", monkeypatch)
     assert log.index("enter:u_alice") < log.index("leave:u_bob")
     assert log.index("enter:u_bob") < log.index("leave:u_alice")
+
+
+# ── failure retry: a raising extractor must not advance the profile ──────
+
+
+async def test_extraction_failure_does_not_advance_profile_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM extraction raises after a batch was selected → the profile is
+    never written, so the same (unbounded-timestamp) batch is retried on
+    the next run instead of being silently dropped."""
+    cluster = _algo_cluster(
+        cluster_id="cl_user00000001",
+        members=["ep_20260101_0001"],
+        last_ts=1_700_000_001_000,
+    )
+    ep_rows = [_episode_row("ep_20260101_0001", "mc_aaaaaaaaaaa1")]
+    mc_rows = [
+        _memcell_row("mc_aaaaaaaaaaa1", sender_id="u_alice", ts_ms=1_700_000_001_000)
+    ]
+
+    with (
+        patch(
+            "everos.memory.strategies.extract_user_profile.cluster_repo"
+        ) as mock_cluster_repo,
+        patch(
+            "everos.memory.strategies.extract_user_profile.episode_repo"
+        ) as mock_episode_repo,
+        patch(
+            "everos.memory.strategies.extract_user_profile.memcell_repo"
+        ) as mock_memcell_repo,
+        patch(
+            "everos.memory.strategies.extract_user_profile.get_llm_client",
+            return_value=object(),
+        ),
+        patch(
+            "everos.memory.strategies.extract_user_profile.ProfileExtractor"
+        ) as mock_extractor_cls,
+        patch(
+            "everos.memory.strategies.extract_user_profile.ProfileReader"
+        ) as mock_reader_cls,
+        patch(
+            "everos.memory.strategies.extract_user_profile.ProfileWriter"
+        ) as mock_writer_cls,
+    ):
+        mock_cluster_repo.list_for_owner = AsyncMock(return_value=[cluster])
+        mock_episode_repo.find_by_owner_entries = AsyncMock(return_value=ep_rows)
+        mock_memcell_repo.find_by_ids = AsyncMock(return_value=mc_rows)
+        mock_memcell_repo.select_oldest_batch = AsyncMock(
+            side_effect=lambda ids, **_: ids
+        )
+        mock_reader_cls.return_value.read = AsyncMock(return_value=None)
+        mock_writer_cls.return_value.write = AsyncMock(return_value=None)
+        mock_extractor_cls.return_value.aextract = AsyncMock(
+            side_effect=RuntimeError("LLM call failed")
+        )
+        mod = importlib.import_module("everos.memory.strategies.extract_user_profile")
+        monkeypatch.setattr(mod, "_writer", None, raising=False)
+        monkeypatch.setattr(mod, "_reader", None, raising=False)
+
+        with pytest.raises(RuntimeError, match="LLM call failed"):
+            await extract_user_profile(_event(), FakeStrategyContext())
+
+    mock_writer_cls.return_value.write.assert_not_called()

@@ -53,6 +53,7 @@ from everalgo.user_memory import ProfileExtractor
 
 from everos.component.embedding import get_embedding_capability
 from everos.component.llm import get_llm_client
+from everos.component.utils.datetime import from_timestamp_ms
 from everos.core.observability.logging import get_logger
 from everos.core.persistence import MemoryRoot
 from everos.infra.ome.context import StrategyContext
@@ -79,6 +80,30 @@ the storage budget for profile re-extractions becomes a concern."""
 PROFILE_MIN_MEMCELLS = 1
 """Opensource parity: skip when the candidate cluster set holds fewer
 than ``N`` memcells across all selected clusters."""
+
+PROFILE_MAX_MEMCELLS = 50
+PROFILE_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
+"""Bound one extraction to the oldest memcells newer than the existing
+profile, worked off in bounded batches (:meth:`memcell_repo.select_oldest_batch`)
+instead of feeding an entire backlog to the LLM in one call. An unbounded
+candidate set (e.g. every member of a "fresh" cluster, mostly already
+processed) can exceed the LLM's input size limit on every retry while the
+profile timestamp never advances, pinning the extraction on the same
+oversized batch forever.
+
+These bytes measure raw ``payload_json`` length only — the actual LLM
+call also carries the prompt template (~10 KB, see
+``everalgo.user_memory.prompts.en.profile``) and, in UPDATE mode, the
+existing profile's rendered ``explicit_info``/``implicit_traits``. Both
+are small relative to this budget and leave ample headroom under the
+LLM's request-size limit; they are not counted here to keep the budget
+check a single, cheap column-projection query.
+
+Concurrency: this bounding runs entirely inside ``extract_user_profile``'s
+per-owner partition lock (see the ``get_partition_lock`` call below), so
+two concurrent runs for the same owner cannot read a stale
+``last_profile_ts`` and select overlapping batches — see
+``test_partition_lock_serialises_runs_on_same_owner``."""
 
 
 _writer: ProfileWriter | None = None
@@ -293,6 +318,13 @@ async def extract_user_profile(
             )
         else:
             memcell_ids = await _select_via_timestamp(event, last_profile_ts)
+
+        memcell_ids = await memcell_repo.select_oldest_batch(
+            memcell_ids,
+            after=from_timestamp_ms(last_profile_ts) if last_profile_ts else None,
+            max_count=PROFILE_MAX_MEMCELLS,
+            max_bytes=PROFILE_MAX_PAYLOAD_BYTES,
+        )
 
         if len(memcell_ids) < PROFILE_MIN_MEMCELLS:
             logger.info(

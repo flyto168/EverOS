@@ -9,7 +9,9 @@ identifiers.
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from datetime import datetime
+
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from everos.core.persistence.sqlite import RepoBase, session_scope
@@ -67,6 +69,50 @@ class _MemcellRepo(RepoBase[Memcell]):
                 rows = (await s.execute(stmt)).scalars().all()
                 by_id.update((r.memcell_id, r) for r in rows)
         return [by_id[mid] for mid in memcell_ids if mid in by_id]
+
+    async def select_oldest_batch(
+        self,
+        memcell_ids: list[str],
+        *,
+        after: datetime | None,
+        max_count: int,
+        max_bytes: int,
+    ) -> list[str]:
+        """Oldest-first ids newer than ``after``, bounded by count and payload bytes.
+
+        Reads only ``memcell_id`` / ``timestamp`` / ``length(payload_json)``, so
+        an arbitrarily large candidate list never pulls payloads into memory.
+        The first row is always kept, even if it alone exceeds ``max_bytes`` —
+        otherwise a single oversized memcell would wedge the backlog forever
+        (every run selects it, then rejects it before including anything).
+
+        Used by ``extract_user_profile`` to work an unbounded candidate set
+        off in bounded batches instead of feeding it to the LLM in one shot.
+        """
+        if not memcell_ids:
+            return []
+        candidates: list[tuple[datetime, str, int]] = []
+        async with session_scope(self._factory) as s:
+            for start in range(0, len(memcell_ids), _SQLITE_IN_CHUNK):
+                chunk = memcell_ids[start : start + _SQLITE_IN_CHUNK]
+                stmt = select(
+                    Memcell.memcell_id,
+                    Memcell.timestamp,
+                    func.length(Memcell.payload_json),
+                ).where(Memcell.memcell_id.in_(chunk))
+                if after is not None:
+                    stmt = stmt.where(Memcell.timestamp > after)
+                rows = (await s.execute(stmt)).all()
+                candidates.extend((ts, mid, size) for mid, ts, size in rows)
+        candidates.sort()
+        picked: list[str] = []
+        total = 0
+        for _, mid, size in candidates[:max_count]:
+            if picked and total + size > max_bytes:
+                break
+            picked.append(mid)
+            total += size
+        return picked
 
 
 memcell_repo = _MemcellRepo()
